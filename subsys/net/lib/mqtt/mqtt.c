@@ -100,7 +100,18 @@ static int client_connect(struct mqtt_client *client)
 	/* Reset the unanswered ping count for a new connection */
 	client->unacked_ping = 0;
 
+#if defined(CONFIG_MQTT_CONNECTED_ON_SEND)
+	/* Mark the client as CONNECTED immediately after the CONNECT packet
+	 * is sent.  TCP ordering guarantees the broker will process CONNECT
+	 * before any subsequent packet, so the broker's Sec. 3.1.4 invariant is
+	 * preserved.  CONNACK still fires via MQTT_EVT_CONNACK; rejection
+	 * closes the socket and fires MQTT_EVT_DISCONNECT as normal.
+	 */
+	MQTT_SET_STATE(client, MQTT_STATE_CONNECTED);
+	NET_INFO("Connect sent, CONNACK pending (MQTT_CONNECTED_ON_SEND)");
+#else
 	NET_INFO("Connect completed");
+#endif
 
 	return 0;
 

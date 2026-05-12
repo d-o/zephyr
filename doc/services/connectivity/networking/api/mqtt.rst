@@ -169,6 +169,48 @@ instead of offloading TLS operations to an offloaded socket.
 An example of how to use TLS with MQTT is also present in
 :zephyr:code-sample:`mqtt-publisher` sample application.
 
+Early publish and subscribe (MQTT_CONNECTED_ON_SEND)
+****************************************************
+
+On constrained targets connected over high-latency links (cellular, overlay
+networks, satellite), waiting for a CONNACK before issuing the first publish
+or subscribe can add meaningful round-trip time to application startup.
+:kconfig:option:`CONFIG_MQTT_CONNECTED_ON_SEND` eliminates this wait.
+
+When the option is enabled, ``mqtt_connect`` marks the client as connected
+immediately after the ``CONNECT`` packet has been transmitted, before the
+broker sends ``CONNACK``.  Applications can then call ``mqtt_publish`` and
+``mqtt_subscribe`` without waiting for ``MQTT_EVT_CONNACK`` first:
+
+.. code-block:: c
+
+   rc = mqtt_connect(&client_ctx);
+   if (rc != 0) {
+      return rc;
+   }
+
+   /* With CONFIG_MQTT_CONNECTED_ON_SEND=y, publish is allowed here. */
+   rc = mqtt_publish(&client_ctx, &pub_param);
+
+   /* Continue normal event loop; MQTT_EVT_CONNACK still fires. */
+   poll(fds, 1, 5000);
+   mqtt_input(&client_ctx);
+
+TCP ordering guarantees the broker processes ``CONNECT`` before any
+subsequent packet, preserving the broker's sequencing invariant from MQTT
+3.1.1 Sec. 3.1.4.  ``MQTT_EVT_CONNACK`` still fires normally when the
+broker's reply arrives.  If the broker rejects the connection the socket is
+closed and ``MQTT_EVT_DISCONNECT`` is notified as usual; no application
+changes are required to handle rejection.
+
+.. note::
+
+   :kconfig:option:`CONFIG_MQTT_CONNECTED_ON_SEND` is designed for MQTT
+   3.1.1.  It is not compatible with MQTT 5.0 enhanced authentication
+   (``AUTH`` packets), which require the client to remain in the connecting
+   state until the authentication exchange completes.  Do not enable this
+   option together with :kconfig:option:`CONFIG_MQTT_VERSION_5_0`.
+
 .. _mqtt_api_reference:
 
 API Reference
