@@ -40,6 +40,7 @@ static struct mqtt_test_ctx {
 	bool pubcomp_handled;
 	bool suback_handled;
 	bool unsuback_handled;
+	bool expect_connack_fail;
 	uint16_t msg_id;
 	int payload_left;
 	const uint8_t *payload;
@@ -51,6 +52,13 @@ static const uint8_t payload_long[] = LOREM_IPSUM;
 static const uint8_t connect_ack_reply[] = {
 	MQTT_PKT_TYPE_CONNACK, 0x02, 0, 0,
 };
+
+/* CONNACK: type=0x20, remaining=2, session_present=0, return_code=5 (Not Authorized) */
+static const uint8_t connect_ack_reject[] = {
+	MQTT_PKT_TYPE_CONNACK, 0x02, 0, 0x05,
+};
+
+static bool broker_reject_next_connect;
 
 static const uint8_t ping_resp_reply[] = {
 	MQTT_PKT_TYPE_PINGRSP, 0,
@@ -200,7 +208,17 @@ static void broker_validate_packet(uint8_t *buf, size_t length, uint8_t type,
 {
 	switch (type) {
 	case MQTT_PKT_TYPE_CONNECT: {
-		test_send_reply(connect_ack_reply, sizeof(connect_ack_reply));
+		if (broker_reject_next_connect) {
+			broker_reject_next_connect = false;
+			test_send_reply(connect_ack_reject, sizeof(connect_ack_reject));
+			/* Broker MUST close the connection after a non-zero CONNACK
+			 * (MQTT 3.1.1 Sec. 3.2.2).
+			 */
+			zsock_close(c_sock);
+			c_sock = -1;
+		} else {
+			test_send_reply(connect_ack_reply, sizeof(connect_ack_reply));
+		}
 		break;
 	}
 	case MQTT_PKT_TYPE_PUBLISH: {
@@ -462,8 +480,14 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 
 	switch (evt->type) {
 	case MQTT_EVT_CONNACK:
-		zassert_ok(evt->result, "MQTT connect failed %d", evt->result);
-		test_ctx.connected = true;
+		if (test_ctx.expect_connack_fail) {
+			zassert_not_ok(evt->result,
+				       "Expected CONNACK rejection, got success");
+		} else {
+			zassert_ok(evt->result, "MQTT connect failed %d",
+				   evt->result);
+			test_ctx.connected = true;
+		}
 		break;
 
 	case MQTT_EVT_DISCONNECT:
@@ -817,6 +841,137 @@ ZTEST(mqtt_client, test_mqtt_pubsub_long)
 	test_pubsub(payload_long, MQTT_QOS_1_AT_LEAST_ONCE);
 	zassert_true(test_ctx.puback_handled, "MQTT client should receive puback");
 }
+
+#if defined(CONFIG_MQTT_CONNECTED_ON_SEND)
+/*
+ * Tests for CONFIG_MQTT_CONNECTED_ON_SEND: verify that mqtt_publish() and
+ * mqtt_subscribe() succeed immediately after mqtt_connect() returns, before
+ * the broker has sent CONNACK.  TCP ordering guarantees the broker processes
+ * CONNECT before any subsequent packet (MQTT 3.1.1 Sec. 3.1.4), so the
+ * broker's invariant is preserved even though the client acts first.
+ */
+
+ZTEST(mqtt_client, test_mqtt_publish_before_connack)
+{
+	int ret;
+	struct mqtt_publish_param param;
+
+	ret = mqtt_connect(&client_ctx);
+	zassert_ok(ret, "MQTT client failed to connect (%d)", ret);
+	prepare_client_fds(&client_ctx);
+
+	test_ctx.payload = payload_short;
+	test_ctx.payload_left = strlen(test_ctx.payload);
+	while (test_ctx.msg_id == 0) {
+		test_ctx.msg_id = sys_rand16_get();
+	}
+
+	param.message.topic.qos = MQTT_QOS_1_AT_LEAST_ONCE;
+	param.message.topic.topic.utf8 = (uint8_t *)get_mqtt_topic();
+	param.message.topic.topic.size = strlen(get_mqtt_topic());
+	param.message.payload.data = (uint8_t *)test_ctx.payload;
+	param.message.payload.len = test_ctx.payload_left;
+	param.message_id = test_ctx.msg_id;
+	param.dup_flag = 0U;
+	param.retain_flag = 0U;
+
+	/* Publish before CONNACK: must succeed with MQTT_CONNECTED_ON_SEND. */
+	ret = mqtt_publish(&client_ctx, &param);
+	zassert_ok(ret, "mqtt_publish() before CONNACK failed (%d)", ret);
+
+	/* Broker sees CONNECT first (TCP ordering), replies with CONNACK. */
+	broker_process(MQTT_PKT_TYPE_CONNECT);
+	client_wait(false);
+	ret = mqtt_input(&client_ctx);
+	zassert_ok(ret, "MQTT client input processing failed (%d)", ret);
+	zassert_true(test_ctx.connected, "MQTT client should be connected after CONNACK");
+
+	/* Broker now sees PUBLISH, replies with PUBACK. */
+	broker_process(MQTT_PKT_TYPE_PUBLISH);
+	client_wait(false);
+	ret = mqtt_input(&client_ctx);
+	zassert_ok(ret, "MQTT client input processing failed (%d)", ret);
+	zassert_true(test_ctx.puback_handled, "PUBACK should arrive after CONNACK");
+
+	test_disconnect();
+}
+
+ZTEST(mqtt_client, test_mqtt_subscribe_before_connack)
+{
+	int ret;
+	struct mqtt_topic topic;
+	struct mqtt_subscription_list sub;
+
+	ret = mqtt_connect(&client_ctx);
+	zassert_ok(ret, "MQTT client failed to connect (%d)", ret);
+	prepare_client_fds(&client_ctx);
+
+	while (test_ctx.msg_id == 0) {
+		test_ctx.msg_id = sys_rand16_get();
+	}
+
+	topic.topic.utf8 = get_mqtt_topic();
+	topic.topic.size = strlen(topic.topic.utf8);
+	topic.qos = MQTT_QOS_1_AT_LEAST_ONCE;
+	sub.list = &topic;
+	sub.list_count = 1U;
+	sub.message_id = test_ctx.msg_id;
+
+	/* Subscribe before CONNACK: must succeed with MQTT_CONNECTED_ON_SEND. */
+	ret = mqtt_subscribe(&client_ctx, &sub);
+	zassert_ok(ret, "mqtt_subscribe() before CONNACK failed (%d)", ret);
+
+	/* Broker sees CONNECT first (TCP ordering), replies with CONNACK. */
+	broker_process(MQTT_PKT_TYPE_CONNECT);
+	client_wait(false);
+	ret = mqtt_input(&client_ctx);
+	zassert_ok(ret, "MQTT client input processing failed (%d)", ret);
+	zassert_true(test_ctx.connected, "MQTT client should be connected after CONNACK");
+
+	/* Broker now sees SUBSCRIBE, replies with SUBACK. */
+	broker_process(MQTT_PKT_TYPE_SUBSCRIBE);
+	client_wait(false);
+	ret = mqtt_input(&client_ctx);
+	zassert_ok(ret, "MQTT client input processing failed (%d)", ret);
+	zassert_true(test_ctx.suback_handled, "SUBACK should arrive after CONNACK");
+
+	test_disconnect();
+}
+
+ZTEST(mqtt_client, test_mqtt_connack_reject_with_connected_on_send)
+{
+	int ret;
+
+	/* Arm broker to send a non-zero CONNACK and close the connection. */
+	broker_reject_next_connect = true;
+	test_ctx.expect_connack_fail = true;
+
+	ret = mqtt_connect(&client_ctx);
+	zassert_ok(ret, "MQTT client failed to connect (%d)", ret);
+	prepare_client_fds(&client_ctx);
+
+	/*
+	 * Broker drains CONNECT, sends reject CONNACK (return code 5), and
+	 * closes the socket.  TCP ordering still holds: the broker saw CONNECT
+	 * before closing, which is the correct rejection sequence per
+	 * MQTT 3.1.1 Sec. 3.2.2.
+	 */
+	broker_process(MQTT_PKT_TYPE_CONNECT);
+
+	/*
+	 * mqtt_input() fires MQTT_EVT_CONNACK (non-zero result) then
+	 * MQTT_EVT_DISCONNECT as the library tears down the connection.
+	 * Return value is -ECONNREFUSED; that is expected here.
+	 */
+	client_wait(false);
+	ret = mqtt_input(&client_ctx);
+	zassert_equal(ret, -ECONNREFUSED,
+		      "Expected -ECONNREFUSED from rejected CONNACK, got %d", ret);
+
+	zassert_false(test_ctx.connected,
+		      "Client must not be connected after CONNACK rejection");
+}
+#endif /* CONFIG_MQTT_CONNECTED_ON_SEND */
 
 static void mqtt_tests_before(void *fixture)
 {

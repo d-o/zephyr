@@ -47,6 +47,34 @@ config MQTT_KEEPALIVE
 	  Keep alive time for MQTT (in seconds). Sending of Ping Requests to
 	  keep the connection alive are governed by this value.
 
+config MQTT_CONNECTED_ON_SEND
+	bool "Mark connection ready when CONNECT packet is sent"
+	default n
+	depends on !MQTT_VERSION_5_0
+	help
+	  When enabled, the MQTT library sets the internal CONNECTED state
+	  immediately after the CONNECT packet is transmitted, rather than
+	  waiting for CONNACK.  This allows mqtt_publish() and
+	  mqtt_subscribe() to be called before CONNACK arrives.
+	  The MQTT_EVT_CONNACK callback still fires when the broker responds.
+	  CONNACK rejection surfaces normally via MQTT_EVT_DISCONNECT when
+	  the broker closes the connection.
+
+	  This is valid under MQTT 3.1.1: the CONNECT and subsequent packets
+	  are TCP-ordered, so the broker's ordering invariant (Sec. 3.1.4) is
+	  preserved regardless of client-side local state.  The phrase
+	  "the Client awaits a CONNACK" (Sec. 3.1.4) is descriptive of the
+	  normal flow, not a prohibition on issuing packets beforehand.
+
+	  Not compatible with MQTT 5.0: enhanced authentication (AUTH packets)
+	  requires the client to remain in the connecting state until the
+	  authentication exchange completes.  Kconfig enforces this by making
+	  the option unavailable when MQTT_VERSION_5_0 is selected.
+
+	  Useful on constrained targets with high-latency broker links
+	  (WiFi, LTE, overlay networks) where blocking publish() until CONNACK
+	  wastes tens to hundreds of milliseconds.
+
 config MQTT_LIB_TLS
 	bool "TLS support for socket MQTT Library"
 	help

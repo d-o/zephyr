@@ -14,3 +14,6 @@ tests:
   net.mqtt.client.mqtt_5_0:
     extra_configs:
       - CONFIG_MQTT_VERSION_5_0=y
+  net.mqtt.client.connected_on_send:
+    extra_configs:
+      - CONFIG_MQTT_CONNECTED_ON_SEND=y
